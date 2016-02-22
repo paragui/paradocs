@@ -1,0 +1,1005 @@
+#!/usr/bin/env bash
+#---
+# file:         paradocs
+# info:         a tiny bash4 markdown documentation tool using pandoc
+# version:      017~160222
+# copyright:    (C) 2016 Christoph Strasser
+# license:-
+#   License GPLv3+: GNU GPL version 3 or later
+#   <http://www.gnu.org/licenses/gpl.html>
+#
+#   This is free software; you are free to change and redistribute it.
+#   There is NO WARRANTY, to the extent permitted by law.
+#---
+
+## DEPENDENCIES
+
+declare ifs && ifs="${IFS}" && declare -a bash_version_ \
+    && IFS='.' read -ra bash_version_ <<< "${BASH_VERSION}" && IFS="${ifs}" \
+    && [[ ${bash_version_[0]} -ge 4 && ${bash_version_[1]} -ge 1 ]] || {
+            echo "aborted: this script needs 'bash', at least version 4.1"
+            exit 1 ; }
+
+[[ -n "$( which pandoc )" ]] || {
+    echo "aborted: this script requires 'pandoc'." ; exit 1 ; }
+
+## SETTING
+
+shopt -s extglob ; set -o pipefail
+
+## LIB
+
+### common functions
+
+#### mp [COUNT] STRING
+mp()
+{
+    [[ -z ${1//[0-9]/} ]] && local n=$1 && shift || local n=1
+    declare string ; string="$( printf "%${n}s" )"
+    printf "%s" "${string// /${1:- }}"
+}
+
+#### ?say # ARRAY
+say()   { [[ -z "${@}" ]] || printf "%s\n" "${@}" ; }
+lsay()
+{
+    for i in "${@}" ; do [[ -z "${i}" ]] || printf "%s '%s'\n" '-' "${i//\'/\'\\\'\'}" ; done
+}
+csay()
+{
+    declare -a args ; args=( "${@}" ) ; declare half ; half=$(( ${#@}/2 ))
+    for (( i=0;i<${half};i++ )) ; do
+        printf "%s%s%s\n" "${args[${i}]}" "$( mp $(( 12-${#args[${i}]} )) )"  "${args[$(( ${half}+${i} ))]}"
+    done ; i=$(( i+${half} ))
+    [[ -z "${args[${i}]}" ]] || printf "%s\n" "${args[${i}]}"
+}
+
+#### usage / abort ARRAY
+usage()
+{
+    printf "Usage:\t$( basename "${0}" ) [PATH] [OPTION [KEY [VAL]...]...]\n"
+}
+abort() {
+    usage ; printf "Try \`${0} --help\` for more infos.\n"
+    printf "%s: " $( basename ${0} ) "${@}" ; echo aborted. ; exit 1 ; }
+
+#### dsay ARRAY[@]
+dsay() # ARRAY[@]
+{
+    for line in "${@}" ; do
+        printf "~~ %s\n" "${line}"
+        [[ "${line%%_*}" == "${line%_}" ]] \
+            && eval "say \"\${!${line}[@]}\"" \
+            || eval "[[ -z \"\${${line}[@]}\" ]] || say \"\${${line}[@]}\""
+    done ;
+    echo ===================
+}
+
+#### pathify PATHNAME
+pathify() # just locale [a-Z], [0-9] and [/_]
+{
+    declare tmp ; tmp="${1//[![:alnum:]]/_}"
+    tmp="${tmp//+(_)/_}" ; tmp="${tmp%_}"
+    printf "%s" "${tmp#_}"
+}
+
+#### validate
+validate() # compare the keys of two associative arrays
+{
+    declare -a prefix ; prefix=( "${1}" "${2}" )
+    declare -A valid ; valid=() ;  valid["${3}"]= ; shift 3
+    until [[ "${1}" == '-' ]] ; do valid["${1}"]= ; shift ; done ; shift
+    for key in "${@}" ; do
+        [[ -n "${valid["${key}"]+x}" ]] || abort "no such key" "-${key}"
+        eval "${prefix[0]}${key}_=( \"\${${prefix[1]}${key}_[@]}\" )"
+    done
+}
+
+
+#### countup PATH SEP DIGITS
+countup() # look at path and printf the next number of indexed files
+{
+    (
+        cd "${1}" || exit 1 ; [[ "${3}" == *([[:digit:]]) ]] || exit 1
+        declare count_ ; count_="$(
+            ls -1Abv | grep -E "+([[:digit:]])${2}+([[:digit:]])" | tail -n 1
+        )"
+        count_=${count_%"${2}"*} ; count_=$(( 10#${count_:- -1} + 1 ))
+        printf "%0${3}i%s\n" "${count_}" "${2}"
+    ) || exit 1
+}
+
+#### deca BASIC_ARRAY_NAME ARGUMENTS
+# This function is the heart of this script.
+# It declares and assigns arrays from given arguments, usage example:
+# ~~~
+# declare -A a_ ; a_=()
+# deca a_ "path" -tags "foo" "bar" -name "baz" -opt - "-name"
+# ~~~                                               ^
+# Now you automagically have:                       |
+# * `a_           `: all keys: `tags`, `name`,`opt` |
+# * `a__          `: default key: `path`            |
+# * `a_tags_      `: `foo` and `bar`                |
+# * `a_name_      `: `baz`                          |
+# * `a_opt_       `: `-name` (single dash takes preceding arg as value)
+deca()
+{
+    #~# SAFE MODE - test if `${1}` is already declared but no `${1}` prefixed
+    #~  declare -a safe ; safe=( $( eval "echo \${!${1}*}" | sed s/^${1}// ) )
+    #~ [[ -z $( eval "echo \${safe+x}" ) ]] \
+    #~     || abort 'at least one array already exists' "${safe[*]}"
+    #~ [[ "$( declare -p | grep "^declare -A ${1}=" )" ]] \
+    #~     || abort "declared associative array needed" "${1}"
+
+    LC_ALL=C # otherwise strange bug at last `eval` of first `if` if umlaut
+
+    [[ "${1}" == *([[:alpha:]_])[[:alpha:]]_ ]] || abort "mad array name" "${1}"
+    declare -a arg ; arg[1]="${1%_}_"   # array prefix, contains all keys found
+                     arg[2]="${1%_}__"  # default array, later last
+
+    for (( idx=2 ; idx<=${#@} ; idx++ )) ; do arg="${@:${idx}:1}" # current arg
+
+        if      [[ "${arg}" == -[[:alpha:]]+([[:alpha:]]) ]] ; then # arg is KEY
+                [[ -z $( eval "echo \${${arg[1]}[\${arg#-}]+x}" ) ]] \
+                    || abort 'key already exists' "${arg}"
+                eval "${arg[1]}[\${arg#-}]="
+                arg[2]="${arg[1]}${arg#-}_"
+                eval "${arg[2]}=()"
+        elif    [[ "${arg}" == '-' ]] ; then (( idx++ )) ; arg="${@:${idx}:1}"
+                eval "${arg[2]}+=( \"\${arg}\"  )"  #
+        else                                        # arg is VALUE
+                eval "${arg[2]}+=( \"\${arg}\"  )"  #
+        fi
+    done ; LC_ALL=
+}
+
+#### string2png PATH STRING FILE
+string2png()
+# requires `imagemagick, very nice for email address spambot protection
+# just monospace fonts work fine, see `convert -list font | grep -i mono`
+{
+    [[ -n "${2}" ]] || return 1
+    declare size    ; size='11'
+    declare width   ; width=$(( (${size}+3)/2 ))
+    declare font    ; font='DejaVu-Sans-Mono-Book'
+    declare bg      ; bg='whitesmoke' # not accurate?! Whatever! Close enouugh;)
+    declare color   ; color='black'
+
+    [[ -e "${1}" ]] || convert                                          \
+            -size $(( ${width}*${#2}+${width} ))x$(( ${size}+8 ))       \
+             xc:"${bg}"                                                 \
+            -font "${font}"                                             \
+            -pointsize ${size}                                          \
+            -fill "${color}"                                            \
+            -annotate +4+$(( ${size}+2 ))                               \
+            "${2}"                                                      \
+            "${1}"
+}
+
+
+
+## CONSTANTS
+
+
+
+### default option/key
+declare -A c_def_ ; c_def_=(
+    [opt]='--help'       [key]='-path'
+)
+
+### enironment
+declare -A c_base_ ; c_base_=(
+    [conf]="${HOME}/.config/paradocs"
+    [home]="${HOME}/.paradocs"
+    [share]="${HOME}/.local/share/paradocs"
+    [com]="${HOME}/.paradocs/com"
+    [pwd]="${PWD}"
+)
+
+### home
+declare -A c_home_ ; c_home_=(
+    [doc]=doc [src]=src [temp]=temp [run]=run
+)
+
+### symlinks
+declare -A c_sym_
+for key in ${!c_home_[@]} ; do c_sym_[${key}]="_${c_home_[${key}]}" ; done
+declare -A c_gsym_ ; c_gsym_=(
+    [conf]=_conf    [com]=_com
+)
+
+### id
+declare -A c_id_ ; c_id_=( # sep is suffix of count
+    [sep]='~'                   [date]=$( date +%y%m%d )
+    [dig]=6
+)
+
+### meta
+declare -A c_meta_ ; c_meta_=(
+    [author]="Christoph Strasser"
+    [date]="$( date +"%d %b %Y" )"
+    [email]="$( rev<<<moc.ohoz@scodarap )"
+    [website]="https://www.duckduckgo.com"
+    [lic]=cc-by-sa
+)
+
+### FILES
+
+declare -A f_run_ ; f_run_=(
+    [para]="main.para"
+    [edit]="edit.para"
+)
+
+declare -A f_com_ ; f_com_=(
+    [dummy]="dummy.md"
+    [index]="index.list"
+    [log]="log.list"
+    [ts]="timestamp"
+    [run]="run.html"
+)
+
+declare -A f_doc_ ; f_doc_=(
+    [config]="config.md"
+    [meta]="meta.md"
+    [content]="content.md"
+    [ref]="reference.md"
+    [chapter]="chapter.list"
+    [hchapter]="chapter-hidden.list"
+    [child]="child.list"
+    [hchild]="child-hidden.list"
+    [breadcrumb]="breadcrumb.md"
+)
+
+declare -A f_temp_ ; f_temp_=(
+    [child]="child.html"
+    [content]="content.html"
+    [nav]="nav.html"
+    [footer]="footer.html"
+    [breadcrumb]="breadcrumb.html"
+)
+
+declare -A f_conf_ ; f_conf_=(
+    [icon]="mousery.png"
+    [license]="cc-by-sa.png"
+    [email]="email.png"
+    [frame]="frame.css"
+    [style]="style.css"
+    [index]="template.html"
+    [main]="main.html"
+    [nav]="nav.html"
+    [footer]="footer.html"
+)
+
+declare -A f_share_ ; f_share_=(
+    [index]="index.html"            # take care that name is unique at all `f_*`, used at `opt_update` for childs
+    [meta]="index-meta.html"
+)
+
+### run
+declare -a c_run_ ; c_run_=(
+    '<a href="'"${c_sym_[run]}/${f_run_[edit]}"'" title="edit source"><span class="icon">#</span>&nbsp;edit</a>'
+)
+
+
+## OPTIONS
+
+
+### valid user input
+declare -A info_ ; info_=()
+declare -A opt_  ; opt_=()
+
+
+### implement
+info_+=( [opt_implement]="Run at first time or recreate basic implementation." )
+opt_[--implement]=opt_implement ; opt_[-I]=opt_implement ; opt_implement()
+{
+    declare -a default ; default=(
+        "${c_meta_[email]}"
+        -author     "${c_meta_[author]}"
+        -license    "${c_meta_[lic]}"
+        -date       "${c_meta_[date]}"
+        -website    "${c_meta_[website]}"
+        -title      "$( basename "${0}" )"
+        #~ "${c_def_[key]}"
+    )
+    declare -A v_ ; v_=() ; deca v_ "${default[@]}"
+    validate v_ u_ "${c_def_[key]#-}" ${!v_[@]} - ${!u_[@]}
+    v__=( "${u__[@]:-"${v__[@]}"}" )          # dsay ${!u_*} ${!c_*} ${!v_*}
+
+    [[ -z "${v_path_[@]}" ]] || abort "no such argument" "${v_path_[*]}"
+
+    declare id ; id="$( mp ${c_id_[dig]} 0 )${c_id_[sep]}${c_id_[date]}"
+
+    # absolute pathes
+    declare -A conf ; conf=() ; for key in "${!f_conf_[@]}"             ; do
+        conf[${key}]="${c_base_[conf]}/${f_conf_[${key}]}"              ; done
+
+    declare -A share ; share=() ; for key in "${!f_share_[@]}"          ; do
+        share[${key}]="${c_base_[share]}/${f_share_[${key}]}"           ; done
+
+    declare -A home ; home=() ; for key in "${!c_home_[@]}"             ; do
+    home[${key}]="${c_home_[${key}]}/${id}"                             ; done
+
+    declare -a breadcrumbs ; declare ifs       ; ifs="${IFS}"
+    IFS='/' read -ra breadcrumbs <<< "${path}" ; IFS="${ifs}"
+
+    mkdir -p "${c_base_[home]}" && cd "${c_base_[home]}" \
+        && mkdir -p "${home[@]}" "${c_base_[conf]}" "${c_base_[share]}" "${c_base_[com]}" \
+        || {
+            abort "no permission to implement all directories" \
+                  "${c_base_[home]},${c_base_[share]},${c_base_[conf]},${c_base_[com]}"
+        }
+
+    # common
+    (
+        cd "${c_base_[com]}" || return
+        [[ -e "${f_com_[ts]}"    ]]  || touch       "${f_com_[ts]}"    || return
+        [[ -e "${f_com_[dummy]}" ]]  || touch       "${f_com_[dummy]}" || return
+        [[ -e "${f_com_[run]}"   ]]  || fileRun  >> "${f_com_[run]}"   || return
+    ) || abort "error at common files"
+
+    # symbolic links, only at `share`
+    (
+        cd "${c_base_[share]}" || return 1
+        for link in "${!c_sym_[@]}" ; do [[ -e "${c_sym_[${link}]}" ]] \
+            || ln -s "${c_base_[home]}/${home[${link}]}" "${c_sym_[${link}]}"
+        done
+        [[ -e "${c_gsym_[conf]}" ]] || ln -s "${c_base_[conf]}" "${c_gsym_[conf]}"
+        [[ -e "${c_gsym_[com]}"  ]] || ln -s "${c_base_[com]}" "${c_gsym_[com]}"
+
+    ) || abort "symbolic links error"
+        #~ [[ -e "${c_gsym_[inc]}"  ]] || ln -s . "${c_gsym_[inc]}"
+
+    # global config
+    (
+        cd "${c_base_[conf]}" || return 1
+        [[ -e "${f_conf_[main]}"    ]] || fileTemplateMain   >> "${f_conf_[main]}"     || return
+        [[ -e "${f_conf_[nav]}"     ]] || fileTemplateNav    >> "${f_conf_[nav]}"      || return
+        [[ -e "${f_conf_[footer]}"  ]] || fileTemplateFooter >> "${f_conf_[footer]}"     || return
+        [[ -e "${f_conf_[frame]}"   ]] || fileCssFrame       >> "${f_conf_[frame]}"    || return
+        [[ -e "${f_conf_[style]}"   ]] || fileCssStyle       >> "${f_conf_[style]}"    || return
+        [[ -e "${f_conf_[license]}" ]] || filePngLicense     >> "${f_conf_[license]}"  || return
+        [[ -e "${f_conf_[icon]}"    ]] || filePngIcon        >> "${f_conf_[icon]}"     || return
+
+        [[ -e "${f_conf_[email]}"   ]] || {
+            [[ ! "$( which convert )" ]] || string2png "${f_conf_[email]}" "${v__}" ; }
+
+    ) || abort "error at writing config files"
+
+    # documentation
+    (
+        cd "${c_base_[home]}/${home[doc]}" || return 1
+        [[ -e "${f_doc_[content]}" ]] || fileWelcome >> "${f_doc_[content]}"     || return
+        [[ -e "${f_doc_[meta]}" ]]    \
+            || say  '---'                                               \
+                    'pagetitle:'        "$( lsay "${v_title_}"  )"      \
+                    'author:'           "$( lsay "${v_author_[@]}"  )"  \
+                    'date:'             "$( lsay "${v_date_}" )"        \
+                    'year:'             "$( lsay "$( date +%Y )" )"     \
+                    'license:'          "$( lsay "${v_license_[@]}" )"  \
+                    'email-name:'       "$( lsay "${v__%@*}" )"         \
+                    'email-provider:'   "$( lsay "${v__#*@}" )"         \
+                    'icon:'             "$( lsay "${c_gsym_[conf]}/${f_conf_[icon]}" )" \
+                    '---'                                               \
+                 >> "${f_doc_[meta]}"  || return # TODO: use it ..
+                    #~ 'para-run:'         "$( lsay "${c_run_[@]}" )"
+        [[ -e "${f_doc_[config]}" ]]    \
+            || say  '---'                       \
+                    'showtoc:'              3   \
+                    'showchild:'            2   \
+                    '---'                       \
+                 >> "${f_doc_[config]}"  || return # TODO: use it ..
+                    #~ 'para-run:'         "$( lsay "${c_run_[@]}" )"
+        [[ -e "${f_doc_[ref]}" ]]    \
+            || say "[website]: ${v_website_}"  >> "${f_doc_[ref]}"  || return
+
+        [[ -e "${f_doc_[chapter]}"   ]] || touch "${f_doc_[chapter]}"  || return
+        [[ -e "${f_doc_[hchapter]}"  ]] || touch "${f_doc_[hchapter]}" || return
+        [[ -e "${f_doc_[child]}"     ]] || touch "${f_doc_[child]}"    || return
+        [[ -e "${f_doc_[hchild]}"    ]] || touch "${f_doc_[hchild]}"   || return
+        [[ -e "${f_doc_[breadcrumb]}" ]] || touch "${f_doc_[breadcrumb]}" || return
+
+    ) || abort "error at writing documentation files"
+
+    (
+        cd "${c_base_[home]}/${home[run]}"
+        [[ -e "${f_run_[edit]}" ]]  || say todo  >> "${f_run_[edit]}"     || return
+
+    ) || abort "error at writing run files"
+
+    u_=() ; opt_update
+}
+
+### update
+info_+=( [opt_update]="Write changes to html." )
+opt_[--update]=opt_update ; opt_[-u]=opt_update ; opt_update()
+{
+
+    declare path ; path="${path_}" ; declare -a parabc ; parabc=()
+
+    cd "${c_base_[share]}/${path}" || abort "no such dir" "${c_base_[share]}/${path}"
+    [[ ${#@} -eq 0 ]]   || abort "mad usage" "${@}"
+
+    declare -A sym ; sym=() ; declare -a ids ; ids=()
+    for link in "${c_sym_[@]}" "${c_gsym_[@]}" ; do
+        sym["${link#_}"]="$( readlink -e "${link}" )" \
+            || abort "symlink missin, auto comin soon" "${link}"
+        sym["${link#_}"]="${link}"
+    done
+
+    # breadcrumbs
+    > "${sym[temp]}/${f_temp_[breadcrumb]}"
+    declare -a breadcrumbs ; breadcrumbs=() ; declare -a temp ; temp=()
+    while read -r line ; do temp+=( "${line}" ) ; done < "${sym[doc]}/${f_doc_[breadcrumb]}"
+    for (( i=0;i<${#temp[@]};i++ )) ; do
+        printf "%s\n" '<span>›&nbsp;<a href="'"$(
+                mp $(( ${#temp[@]}-${i} )) '../'
+            )${f_share_[index]}"'">'"${temp[${i}]}"'</a></span>' \
+        >> "${sym[temp]}/${f_temp_[breadcrumb]}"
+    done
+    [[ -z "${path}" ]] || path="$( mp $(( ${#temp[@]}+1 )) '../' )${f_share_[index]}"
+
+    # childs
+    > "${sym[temp]}/${f_temp_[child]}"
+    for child in $( ls */"${f_share_[index]}" 2>/dev/null ) ; do
+        printf "%s\n" '<li><a href="'"${child}"'">'"$( dirname "${child}" )"'</a>' \
+        >> "${sym[temp]}/${f_temp_[child]}"
+    done
+
+    pandoc -s -S --template "${sym[conf]}/${f_conf_[nav]}"                      \
+        -V para-main=1 -V para-home="${path}"  -V para-bc="$( cat "${sym[temp]}/${f_temp_[breadcrumb]}" )"                                   \
+        -o "${sym[temp]}/${f_temp_[nav]}" "${sym[doc]}/${f_doc_[meta]}"         \
+    && pandoc -s -S --template "${sym[conf]}/${f_conf_[footer]}" -V cc-by-sa=1  \
+        -o "${sym[temp]}/${f_temp_[footer]}" "${sym[doc]}/${f_doc_[meta]}"      \
+    && pandoc --toc -s -S --template "${sym[conf]}/${f_conf_[main]}"  \
+        -c "${sym[conf]}/${f_conf_[style]}" -c "${sym[conf]}/${f_conf_[frame]}" \
+        -B "${sym[temp]}/${f_temp_[nav]}" -A "${sym[temp]}/${f_temp_[nav]}" -A "${sym[temp]}/${f_temp_[footer]}" \
+        -V para-child="$( cat "${sym[temp]}/${f_temp_[child]}" )"               \
+        -o "${f_share_[index]}" "${sym[doc]}/${f_doc_[meta]}" "${sym[doc]}/${f_doc_[content]}" "${sym[doc]}/${f_doc_[ref]}"   \
+    || abort "error at pandoc generating"
+
+}
+
+### new
+info_+=( [opt_new]="Create a new book." )
+opt_[--new]=opt_new ; opt_[-n]=opt_new ; opt_new()
+{
+    declare -a default ; default=(                                             #
+        "$( date +%H:%M:%S )"                                               # title
+        -name                                                                  #
+        -author     "${c_meta_[author]}"                                       #
+        -date       "${c_meta_[date]}"
+        -license    "${c_meta_[lic]}"                                          #
+        -email      "${c_meta_[email]}"
+        #~ "${c_def_[key]}"                                                            #
+    )                                                                          #
+    declare -A v_ ; v_=() ; deca v_ "${default[@]}"                            #
+    validate v_ u_ "${c_def_[key]#-}" ${!v_[@]} - ${!u_[@]}                          #
+    v__=( "${u__[@]:-"${v__[@]}"}" )                                          # dsay ${!u_*} ${!c_*} ${!v_*}
+
+    declare title ; title="${v__}"
+    declare new   ; new="${v_name_:-"$( pathify "${title//[![:alnum:]]/_}" )"}"
+    declare name  ; name="${new:-"$( pathify "${default}" )"}"
+    declare path  ; path="${v_path_//+(\/)/\/}"    ; path="${path%/}"
+                    new="${path:+"${path}/"}${name,,}"
+    [[ "${name}" == "$( pathify "${name}" )" && -n "${name}" ]] \
+        || abort "mad name" "${v_name_[*]}"
+
+    declare -A conf ; conf=() ; for key in "${!f_conf_[@]}"             ; do
+        conf[${key}]="${c_base_[conf]}/${f_conf_[${key}]}"              ; done
+
+    [[ ! -e "${c_base_[share]}/${new}" ]] || abort "new dir already existing" "${new}"
+    cd "${c_base_[share]}" || return
+
+    declare -a breadcrumbs ; declare ifs      ; ifs="${IFS}"
+    IFS='/' read -ra breadcrumbs <<< "${new}" ; IFS="${ifs}"
+
+    declare -A share ; share=() ; declare id ; id= ; declare -A home ; home=()
+
+    path= ; declare -a curb ; curb=() # current breadcrumbs
+    for (( i=0;i<${#breadcrumbs[@]};i++ )) ; do
+
+        path="${breadcrumbs[${i}]}" ; curb=( "${breadcrumbs[@]::${i}}" )
+        [[ ${i} == $(( ${#breadcrumbs[@]} -1 )) ]] && title="${v__}" \
+            || title="${path}"
+
+        [[ -d "${path}" ]] && { cd "${path}" || exit 1 ; } && continue
+        mkdir -p "${path}" && cd "${path}"   || exit 1
+
+        id="$(
+            countup "${c_base_[home]}/${c_home_[doc]}" "${c_id_[sep]}" "${c_id_[dig]}"
+        )${c_id_[date]}" || abort "error generating id" "${id}"
+
+        for key in "${!c_home_[@]}" ; do
+            home[${key}]="${c_home_[${key}]}/${id}" ; done
+
+        for dir in "${home[@]}" ; do
+            [[ ! -e "${c_base_[home]}/${dir}" ]] \
+                || abort "id already exists" "${c_base_[home]}/${dir}"
+        done
+
+
+
+        ( cd "${c_base_[home]}" && mkdir -p "${home[@]}" ) || exit 1
+
+        # documentation
+        (
+            cd "${c_base_[home]}/${home[doc]}" || return 1
+            touch "${f_doc_[content]}"     || return
+            say  '---'                                               \
+                 'pagetitle:'        "$( lsay "${title} - $( basename "${0}" ) "  )"      \
+                 'title:'            "$( lsay "${title}"  )"      \
+                 'author:'           "$( lsay "${v_author_[@]}"  )"  \
+                 'date:'             "$( lsay "${v_date_}" )"        \
+                 'year:'             "$( lsay "$( date +%Y )" )"     \
+                 'license:'          "$( lsay "${v_license_[@]}" )"  \
+                 'email-name:'       "$( lsay "${v_email_%@*}" )"         \
+                 'email-provider:'   "$( lsay "${v_email_#*@}" )"         \
+                 'icon:'             "$( lsay "${c_gsym_[conf]}/${f_conf_[icon]}" )" \
+                 '---'                                               \
+                  >> "${f_doc_[meta]}"  || return
+                        #~ 'para-run:'         "$( lsay "${c_run_[@]}" )"
+            say "[#]: put href here"  >> "${f_doc_[ref]}"  || return
+            say  '---'                                               \
+                 'showtoc:'             3   \
+                 'showchild:'           2   \
+                 '---'                                               \
+                 >> "${f_doc_[config]}"  || return # TODO: use it ..
+
+            touch "${f_doc_[chapter]}"  || return
+            touch "${f_doc_[hchapter]}" || return
+            touch "${f_doc_[child]}"    || return
+            touch "${f_doc_[hchild]}"   || return
+            say "${curb[@]%/}" > "${f_doc_[breadcrumb]}" || return
+
+        ) || abort "error at writing documentation files"
+
+        for link in "${!c_sym_[@]}" ; do
+            ln -s "${c_base_[home]}/${home[${link}]}" "${c_sym_[${link}]}"
+        done \
+        && ln -s "${c_base_[conf]}" "${c_gsym_[conf]}"  \
+        && ln -s "${c_base_[com]}" "${c_gsym_[com]}"    \
+        || abort "error creating new links"
+    done
+
+    until [[ "${new}" == '.' ]] ; do
+
+        path_="${new}" ; opt_update
+        new="$( dirname "${new}" )"
+    done
+    path_= ; opt_update
+
+}
+
+
+### help
+info_+=( [opt_help]="Show this help." )
+opt_[--help]=opt_help ; opt_[-h]=opt_help ; opt_help()
+{
+    declare -A temp ; temp=()
+    declare -a out  ; out=()
+
+    for opt in "${!opt_[@]}" ; do
+        if [[ "${#opt}" -eq 2 ]] ; then
+            temp["${opt_["${opt}"]}"]="${opt},${temp[${opt_["${opt}"]}]}"
+        else
+            temp["${opt_["${opt}"]}"]+="${opt}"
+        fi
+    done
+
+    for func in $( say "${!temp[@]}" | sort ); do
+        out+=( "$( printf "%s\n\t%s\n" "${temp[$func]}" "${info_[$func]}" )" )
+    done
+
+    usage ; say '' Options: "${out[@]}"
+}
+
+### gui
+#~ info_+=( [opt_gui]="Run the graphical user interface." )
+#~ opt_[--gui]=opt_gui ; opt_[-G]=opt_gui ; opt_gui()
+#~ {
+    #~ notify-send "imagine a gui at path: ${u_path_}"
+#~ }
+
+
+## FILE GENERATORS
+
+
+### fileRun     #@todo not global
+fileRun()
+{
+    say \
+    '<a class="" href="'"${c_sym_[run]}/${f_run_[para]}"'" title="This is paradocs!">&#9874;</a>'               \
+    '<ul class="para-hidden sub">'                                                                              \
+    '<li><a href="'"${c_sym_[doc]}/${f_doc_[content]}"'" title="open source"><span class="icon">&#9997;</span>&nbsp;edit</a>'   \
+    '<li><a href="'"${c_sym_[doc]}/${f_doc_[ref]}"'" title="edit link"><span class="icon">#</span>&nbsp;reference</a>'   \
+    '<li><a href="'"${c_sym_[doc]}/${f_doc_[meta]}"'" title="meta information"><span class="icon">?</span>&nbsp;meta</a>'   \
+    '</ul>'
+}
+
+### fileWelcome
+fileWelcome()
+{
+    cat << \
+'-------------------------------------------------- EOF-FILE'
+Welcome to `paradocs`! Visit this beatiful [website]!
+-------------------------------------------------- EOF-FILE
+}
+
+### file_license FILE
+filePngLicense()
+{
+    xxd -r -p <<< \
+'89504e470d0a1a0a0000000d49484452000000500000000f0802000000fc
+abdfd8000001924944415448c7e596314fc2401480df0ff00e3bb2c1a9c1
+89486e22c481721bae9d481ccbe0a4833791100760c30496fb0be7a42e06
+0627082117ff017fe1fec2193d52b1960a0998d4be74b834f7da7ef9de7b
+3d801486494d7c013f3ccad5ab79d504805eaf1799c618c3180fc5c06e9e
+bfcd33879944788d061e8a01c6781d6dc05c382dd8fda3d751bbdd4e3070
+e5bc92cfe7e36b432905008dcb864d99a959fda29e54608491d5ab942284
+0000634c6bcd180300428852ca4a2ed15250d5fdfb7ee45c08bfecfb3a3e
+65ddce5d02b7ee5a00301e8f8d318410cff38c31fc331cc7d15a0b21a494
+f626c228a8eac97412f9f4d02286363e7d5fc037b7d700a094d25aafce2d
+cff328a5ab55cd39c718dbace797a7e97c1aa32bd27368c34fbdbb95bc85
+61c698effbd630e75c08b1348cb630bca1ae5021ec1df8a387d1b287a594
+8ee30080effb410f534a178b8531a656ab15cf8a1bf6f0af5fbfaee7ff02
+b85c29e772b9144de9a1182074d0ed7663805dd73d3e39fa27ffe1607475
+3a9d48daaa5bcd66b3c93e69a5eb2c9daa780728bf744c58e06ec0000000
+0049454e44ae426082'
+}
+
+filePngIcon()
+{
+    xxd -r -p <<< \
+'89504e470d0a1a0a0000000d4948445200000016000000160806000000c4
+b46c3b00000006624b4744000000000000f943bb7f000000097048597300
+000b1300000b1301009a9c180000000774494d4507df0c1311100f6f79d7
+ad0000001974455874436f6d6d656e740043726561746564207769746820
+47494d5057810e17000002004944415438cba5d53b6815411406e06f9348
+5434a8186d7c4144720911031622083e40101fd8c58885bd584710044148
+61616d65278236b150d422a0d808015192556c1282185f11058d42ccd8cc
+cab0b9bb917860b83be7fee7dfff9cddf9b755f3d88a16fcb478ac8feb5b
+1de8143e23601ec3e8acc06ec6a3880d98c6f166c05d98c3bd900b2117f0
+05cfb0a284edc038de27d891d8e10eb1dd224e6326e48e1489905b833e9c
+2f115fc0b690db9060f74761fdd096803bf1b6dc7ac8b5650d83381095cf
+626fc81774011f8bfa54f14b342ae6b92e927ec7ea388a66b125f2c84a7f
+7cc064c8ed4e9359839057ef636e2cdeb41bb3a9e22e2cc3aa264a9e97f6
+634d302bd18eb565c5f7b1273eb02545d6f003773190250762a2dcde12c9
+e7b0b118455f0df04dd6589093350c5594b4a1b720ce6a4474e157c5c9ab
+d453108fd7804642aebd947b1a72676a6a5ea54a5fa025e47afe63be5398
+c4bef475bb889eace15a093c5a41325adadfc0265c6a86bf129dea6a622e
+a1b84e579ac7f5583758d7d150043dfe17e2e87ef3d198168d63f854786d
+15715cef7070c1a892eb87c9fe37be62394e343b38f1ddbe13c93ba2a165
+d1a84ed6a93e5a144685c3a5df809b388cd63ac570281a75171ee0166ea3
+23e4ba13b513788d7318887579c43f8937fd1b677139da5e1abd98895f87
+a938a6696c2fe176c607df0f7f009970d3d17903c22d0000000049454e44
+ae426082'
+}
+
+
+fileTemplateFooter()
+{
+    cat << \
+'-------------------------------------------------- EOF-FILE'
+<a id="id_totop" href="#id_top-of-the-page">↑</a>
+
+<nav id="id_license" class="navbar"><table><tbody><tr><td>
+$if(cc-by-sa)$
+<a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/">
+    <img alt="Creative Commons Attribution-ShareAlike 4.0 International License" style="padding-bottom:2px;" src="_conf/cc-by-sa.png" /></a>
+$endif$
+<span>© $year$ $for(author)$$author$ $endfor$</span>
+$if(email-name)$$if(email-provider)$
+<img alt="CONTACT: name is '$email-name$' and webmail provider '$email-provider$'" style="border-width:0" src="_conf/email.png" />
+$endif$$endif$
+</td></tr></tbody></table></nav>
+-------------------------------------------------- EOF-FILE
+}
+
+fileTemplateNav()
+{
+    say                                                                                                     \
+    '<nav class="navbar"><table><tbody><tr>'                                                                \
+    '<td class="button corner run">'                                                                        \
+    '$if(para-main)$'                                                                                       \
+    "$( cat "${c_base_[com]}/${f_com_[run]}" )"                                                             \
+    '$endif$'                                                                                               \
+    '</td>'                                                                                                 \
+    '<td class="spacer"></td>'                                                                              \
+    '<td class="logo button">'                                                                              \
+    '$if(para-home)$'                                                                                       \
+    '    <a href="$para-home$" title="home">¤</a>'                                                          \
+    '$endif$'                                                                                               \
+    '</td>'                                                                                                 \
+    '<td class="breadcrumbs">'                                                                              \
+    '$if(para-bc)$'                                                                                        \
+    '    $para-bc$'                                                                                         \
+    '$endif$'                                                                                               \
+    '</td>'                                                                                                 \
+    '<td class="browse button">'                                                                            \
+    '$if(oktp-prev)$'                                                                                       \
+    '    <span class="para-hidden">|&nbsp;</span><a href="$para-prev$" title="previous">←</a>'              \
+    '$endif$'                                                                                               \
+    '</td>'                                                                                                 \
+    '<td class="meta button">'                                                                              \
+    '    <span class="para-hidden">|&nbsp;</span><a href="'"${f_share_[meta]}" '" title="meta data">&#9873;</a>'   \
+    '</td>'                                                                                                 \
+    '<td class="browse button">'                                                                            \
+    '$if(para-next)$'                                                                                       \
+    '    <span class="para-hidden">|&nbsp;</span><a href="$para-next$" title="next">→</a>'                  \
+    '$endif$'                                                                                               \
+    '</td>'                                                                                                 \
+    '<td class="button corner"></td>'                                                                       \
+    '</tr></tbody></table></nav>'
+
+}
+
+fileTemplateMain()
+{
+    cat << \
+'-------------------------------------------------- EOF-FILE'
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml"$if(lang)$ lang="$lang$" xml:lang="$lang$"$endif$>
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta http-equiv="Content-Style-Type" content="text/css" />
+  <meta name="generator" content="pandoc" />
+$for(author-meta)$
+  <meta name="author" content="$author-meta$" />
+$endfor$
+$if(date-meta)$
+  <meta name="date" content="$date-meta$" />
+$endif$
+  <title>$if(title-prefix)$$title-prefix$ - $endif$$pagetitle$</title>
+  <link rel="shortcut icon" href="$if(icon)$$icon$$endif$">
+  <style type="text/css">
+    code              { white-space: pre; }
+    .para-center      { max-width:1024px;margin:0 auto; }
+    .para-micro       { font-size:0; }
+    .para-hidden      { display:none; }
+    .para-adjoin      { padding:0;margin:0; }
+    .para-adjoinsub * { padding:0;margin:0; }
+  </style>
+$if(quotes)$
+  <style type="text/css">q { quotes: "“" "”" "‘" "’"; }</style>
+$endif$
+$if(highlighting-css)$
+  <style type="text/css">
+$highlighting-css$
+  </style>
+$endif$
+$for(css)$
+  <link rel="stylesheet" href="$css$" $if(html5)$$else$type="text/css" $endif$/>
+$endfor$
+$if(math)$
+  $math$
+$endif$
+$for(header-includes)$
+  $header-includes$
+$endfor$
+</head>
+<body><div class="para-center" id="id_top-of-the-page"> <!-- closed at bottom right before `body` -->
+<div id="id_topline">
+        <a href="#id_content" title="go to content" class="para-micro">^^^content</a>
+</div>
+
+$for(include-before)$
+$include-before$
+$endfor$
+
+<div id="id_content">
+
+$if(title)$
+<div id="$idprefix$header">
+<h1 class="title">$title$</h1>
+$if(subtitle)$
+<code class="subtitle">$subtitle$</code>
+$endif$
+<!--
+$for(author)$
+<code class="author">$author$</code>
+$endfor$
+-->
+$if(date)$
+<code class="date">$date$</code>
+$endif$
+</div>
+$endif$
+
+$if(para-child)$
+<div id="id_child">
+<ul>
+$para-child$
+</ul>
+</div>
+$endif$
+
+$if(toc)$
+<div id="$idprefix$TOC">
+$toc$
+</div>
+$endif$
+
+$body$
+
+</div>
+
+$for(include-after)$
+$include-after$
+$endfor$
+</div></body>
+</html>
+-------------------------------------------------- EOF-FILE
+}
+
+
+fileCssFrame()
+{
+    cat << \
+'-------------------------------------------------- EOF-FILE'
+
+    html {
+        color:#111;
+    }
+    body {
+        overflow:scroll;background:#ddd;padding:0;margin:0;
+    }
+    #id_content {
+
+        background:white;padding:1em;
+
+    }
+    .navbar {
+        font-family:monospace;color:grey;
+    }
+    .navbar * {
+        padding:0;margin:0;
+    }
+    .navbar a {
+        text-decoration:none;
+    }
+    .navbar table {
+        height:40px;
+        background:#011;table-layout:fixed;width:100%;
+        border-collapse:collapse;overflow:auto;
+    }
+    .logo a {
+        color:cornflowerblue;
+    }
+    .logo a:hover {
+         border:thin solid cornflowerblue;
+     }
+    .browse a {
+        color:gold;
+    }
+    .browse a:hover {
+         border:thin solid gold;
+     }
+    .meta a {
+        color:lime;
+    }
+    .meta a:hover {
+         border:thin solid lime;
+     }
+
+    .button     { width:32px;text-align:center; }
+    .button a   { display:block;font-weight:bold;font-size:x-large;padding:4px; }
+
+    /*
+    #id_logo    { min-width:32px;width:44px;padding-left:8px; }
+    #id_logo a  { padding:1px;margin:0;font-size:x-large;overflow:hidden;
+                  color:orange;
+                }
+    #id_logo a:hover
+                { color:gold; }
+    */
+    .breadcrumbs
+                { font-size:large;overflow:hidden;min-width:32px;padding:0 8px; }
+    .breadcrumbs span
+                { white-space:pre; }
+    .breadcrumbs a,.breadcrumbs a:visited
+                { padding:1px;margin:0;line-height:1.42em;color:white;
+                }
+    .breadcrumbs a:hover
+                { text-decoration:underline; }
+
+    .spacer     { width:8px; }
+
+    .corner     { width:28px;text-align:center; }
+    .corner a
+                { background:transparent;color:#555;font-size:normal; }
+
+    #id_totop {
+        display:block;font-weight:bold;padding:8px 0 0 0;
+        text-align:center; width:24px;height:28px;
+        position:fixed;bottom:2px;right:2px;text-decoration:none;color:white;
+        }
+    #id_totop:hover,#id_totop:focus {
+        background:maroon;
+        }
+
+    .run            { padding-left:0.3em; }
+    .run a          { border:thin solid transparent; }
+    .run a:hover    { color:crimson;font-weight:bold; }
+    .run:hover > ul
+                {   display:inline-block;position:absolute;width:100%;
+                    max-width:200px;
+                    background:transparent;
+                }
+
+    ul.sub      { list-style-type:none;border:solid #011;background:#011;margin-left:-1.45em;
+                }
+
+    ul.sub li     { text-align:left;background:#012;
+                    border-right:thin dotted firebrick;
+                    border-bottom:thin dotted firebrick;
+                    border-left:thin dotted firebrick;
+                }
+    .sub li:first-child      {   border-top:thin dotted firebrick; }
+    .sub li span  { width:32px; }
+    .sub a      {   color:lightgrey;font-weight:normal;
+                    padding:8px;
+                }
+    .icon       { color:lightyellow;font-weight:bold; }
+
+
+    .button a:focus
+                { background:lightgrey;color:maroon; }
+
+
+
+
+    #id_footer {
+        font:large monospace;color:grey;
+        padding:0 0.2em;
+    }
+    #id_footer a {
+        text-decoration:none;
+    }
+    #id_footer span {
+        position:absolute;right:0;
+    }
+
+    #id_topline a { display:block;padding:3px 0 0;background:cornflowerblue;pointer-events:none; }
+    #id_topline a:focus { background:crimson; }
+
+    #id_license { background:transparent;padding:0 40px 0 11px; }
+    #id_license table   { background:transparent; }
+    #id_license span    { vertical-align:5px; }
+-------------------------------------------------- EOF-FILE
+}
+
+fileCssStyle()
+{
+    cat << \
+'-------------------------------------------------- EOF-FILE'
+#id_content { font-family: Palatino,Courier; }
+-------------------------------------------------- EOF-FILE
+}
+
+
+## INIT & RUN
+
+
+cd "${c_base_[home]}" 2>/dev/null || {
+    [[ "${opt_["${1}"]}" == "opt_implement" ]] \
+    || abort "not implemented, run with option -I or look at help" "${c_base_[home]}"
+}
+
+declare path_ ; path_= ; declare -A run_ ; run_=()
+
+if [[ -z "${opt_[${1:-${c_def_[opt]}}]}" ]] ; then
+    [[ "${1}" != -* ]] && path_="${1%\/}" || abort "no such option" "${1}"
+    [[ "${path_//\//_}" == "$( pathify "${path_//\//_}" )" ]] \
+        || abort "mad path" "${1}"
+    shift
+fi
+
+[[ -n "${opt_[${1:-${c_def_[opt]}}]}" ]] || abort "no such option" "${1}"
+run_[func]="${opt_[${1:-${c_def_[opt]}}]}"
+shift
+
+# keeps the values of default key
+declare -A u_ ; u_=() ; deca u_ "${@}" "${c_def_[key]}" "${path_[@]}"
+
+${run_[func]} "${@}" ; exit
