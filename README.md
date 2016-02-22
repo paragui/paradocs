@@ -1,9 +1,14 @@
 # paradocs
-minimalistic bash4 static site generator using pandoc
+minimalistic bash4 static site generator using [pandoc](http://johnmacfarlane.net/pandoc)
 
 
 **Attention:** The script as a whole is not in a working state! A lot is inserted hastily since the last four days.
 More and cleaning will come soon.
+
+# Dependencies
+* GNU/Linux or similar
+* at least `bash` 4.1, not tested
+* optional: `imagemagick` to print out your email as `.png`
 
 # Help
 ~~~
