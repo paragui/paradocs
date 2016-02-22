@@ -4,6 +4,7 @@
 # info:         a tiny bash4 markdown documentation tool using pandoc
 # version:      017~160222
 # copyright:    (C) 2016 Christoph Strasser
+# email:        "$( rev<<<moc.ohoz@scodarap )"
 # license:-
 #   License GPLv3+: GNU GPL version 3 or later
 #   <http://www.gnu.org/licenses/gpl.html>
