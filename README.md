@@ -2,7 +2,7 @@
 minimalistic bash4 static site generator using [pandoc](http://johnmacfarlane.net/pandoc)
 
 
-**Attention:** The script as a whole is not in a working state! A lot is inserted hastily since the last four days.
+**Attention:** The script as a whole is not in a working state! A lot is inserted hastily since the last few days.
 More and cleaning will come soon.
 
 # Dependencies
